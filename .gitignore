@@ -1,0 +1,15 @@
+**/bin/
+**/obj/
+TestResults/
+.env
+.env.*
+!.env.example
+*.har
+*.pfx
+*.key
+*.crt
+*.pem
+work/
+.vs/
+*.user
+*.log

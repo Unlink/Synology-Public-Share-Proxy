@@ -1,0 +1,32 @@
+services:
+  share-proxy:
+    build: .
+    image: synology-public-share-proxy:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PROXY_PORT:-8088}:8080"
+    environment:
+      Proxy__DsmOrigin: ${DSM_ORIGIN:?Set DSM_ORIGIN in .env}
+      Proxy__PublicOrigin: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN in .env}
+      Proxy__UploadsEnabled: ${UPLOADS_ENABLED:-true}
+      Proxy__PasswordLoginEnabled: ${PASSWORD_LOGIN_ENABLED:-true}
+      Proxy__MaxUploadBytes: ${MAX_UPLOAD_BYTES:-1073741824}
+      Proxy__MaxDownloadBytes: ${MAX_DOWNLOAD_BYTES:-10737418240}
+      Proxy__MaxConcurrentTransfers: ${MAX_CONCURRENT_TRANSFERS:-4}
+      Proxy__TransferTimeoutSeconds: ${TRANSFER_TIMEOUT_SECONDS:-1800}
+      Proxy__IdleTimeoutSeconds: ${IDLE_TIMEOUT_SECONDS:-60}
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
