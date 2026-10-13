@@ -10,7 +10,7 @@ public sealed class SessionStore(ProxyOptions options, Uri dsmOrigin, bool devel
     private readonly Dictionary<string, BrowserSession> sessions = new(StringComparer.Ordinal);
     private readonly bool secureCookies = SecureCookies(options, development);
     private readonly string cookieName = SecureCookies(options, development) ? "__Host-ShareSession" : "share-dev";
-    private static bool SecureCookies(ProxyOptions settings, bool dev) => !dev ||
+    private static bool SecureCookies(ProxyOptions settings, bool dev) =>
         (Uri.TryCreate(settings.PublicOrigin, UriKind.Absolute, out var publicUri) && publicUri.Scheme == "https");
     public sealed class BrowserSession
     {

@@ -61,6 +61,19 @@ public sealed class GatewayTests
         Assert.Contains("httponly", cookie);
     }
 
+    [Fact] public void HttpSessionWorksInProduction()
+    {
+        var settings = new ProxyOptions { PublicOrigin = "http://share.example" };
+        using var store = new SessionStore(settings, new Uri(Options.DsmOrigin), false);
+        var context = new DefaultHttpContext();
+        using var lease = store.Acquire(context);
+        var cookie = context.Response.Headers.SetCookie.ToString();
+        Assert.StartsWith("share-dev=", cookie);
+        Assert.DoesNotContain("secure", cookie);
+        Assert.Contains("httponly", cookie);
+        Assert.Contains("samesite=strict", cookie);
+    }
+
     [Fact] public async Task MetadataConcurrencyIsBoundedAndSlotsRecoverAfterCompletion()
     {
         var allStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -96,15 +109,17 @@ public sealed class GatewayTests
     [Theory]
     [InlineData("../private.txt")][InlineData("x\\private.txt")][InlineData("x:stream")][InlineData("file\r\nHeader")][InlineData("..")] [InlineData("unsafe.")]
     public void RejectsUnsafeFilenames(string filename) => Assert.Throws<ProxyException>(() => Input.Filename(filename));
-    [Fact] public void RejectsPublicHttpUnsupportedSchemesAndCredentialOrigins()
+    [Fact] public void RejectsUnsupportedSchemesAndCredentialOrigins()
     {
-        Assert.Throws<InvalidOperationException>(() => new ProxyOptions { DsmOrigin = "http://nas.example:5000", PublicOrigin = Options.PublicOrigin }.Validate(false));
+        Assert.Throws<InvalidOperationException>(() => new ProxyOptions { DsmOrigin = "http://nas.example:5000/sharing/token", PublicOrigin = Options.PublicOrigin }.Validate(false));
         Assert.Throws<InvalidOperationException>(() => new ProxyOptions { DsmOrigin = "ftp://nas", PublicOrigin = Options.PublicOrigin }.Validate(false));
         Assert.Throws<InvalidOperationException>(() => new ProxyOptions { DsmOrigin = "https://user:password@nas", PublicOrigin = Options.PublicOrigin }.Validate(false));
         Assert.Throws<InvalidOperationException>(() => new ProxyOptions { DsmOrigin = "https://nas/admin", PublicOrigin = Options.PublicOrigin }.Validate(false));
     }
     [Theory]
     [InlineData("http://localhost:5000")]
+    [InlineData("http://host.docker.internal:5000")]
+    [InlineData("http://HOST.DOCKER.INTERNAL:5000")]
     [InlineData("http://127.0.0.1:5000")]
     [InlineData("http://192.168.1.20:5000")]
     [InlineData("http://10.1.0.2:5000")]
@@ -116,11 +131,14 @@ public sealed class GatewayTests
         => Assert.Equal("http", new ProxyOptions { DsmOrigin = origin, PublicOrigin = Options.PublicOrigin }.Validate(false).Scheme);
     [Theory]
     [InlineData("http://8.8.8.8")]
+    [InlineData("http://host.docker.internal.example:5000")]
+    [InlineData("http://docker.host.internal:5000")]
+    [InlineData("http://nas.example:5000")]
     [InlineData("http://172.32.0.1")]
     [InlineData("http://100.128.0.1")]
     [InlineData("http://[2001:4860:4860::8888]")]
-    public void RejectsPublicHttpAddresses(string origin)
-        => Assert.Throws<InvalidOperationException>(() => new ProxyOptions { DsmOrigin = origin, PublicOrigin = Options.PublicOrigin }.Validate(false));
+    public void SupportsConfiguredPublicHttpAddresses(string origin)
+        => Assert.Equal("http", new ProxyOptions { DsmOrigin = origin, PublicOrigin = origin }.Validate(false).Scheme);
     [Fact] public void ParsesJsonAssignmentsWithoutExecutingScript()
     {
         var (s, e) = DsmGateway.ParseSession(Session()); using (s) using (e) Assert.Equal("Project", e.RootElement.GetProperty("filename").GetString());

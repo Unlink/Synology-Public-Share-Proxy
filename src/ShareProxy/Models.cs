@@ -1,5 +1,3 @@
-using System.Net;
-using System.Net.Sockets;
 using System.Text.RegularExpressions;
 
 namespace ShareProxy;
@@ -22,14 +20,14 @@ public sealed class ProxyOptions
 
     public Uri Validate(bool development)
     {
-        if (!Uri.TryCreate(DsmOrigin, UriKind.Absolute, out var uri) || uri.Scheme is not ("https" or "http") ||
-            (uri.Scheme == "http" && !LocalHttpHost(uri)) ||
-            uri.AbsolutePath != "/" || uri.UserInfo.Length > 0 || uri.Query.Length > 0 || uri.Fragment.Length > 0)
-            throw new InvalidOperationException("Proxy:DsmOrigin requires HTTPS, or HTTP on localhost/a private IP, without credentials, path or query.");
+        if (!Uri.TryCreate(DsmOrigin, UriKind.Absolute, out var uri) || uri.Scheme is not ("https" or "http"))
+            throw new InvalidOperationException("Proxy:DsmOrigin must be an absolute address beginning with http:// or https://.");
+        if (uri.AbsolutePath != "/" || uri.UserInfo.Length > 0 || uri.Query.Length > 0 || uri.Fragment.Length > 0)
+            throw new InvalidOperationException("Proxy:DsmOrigin must contain only scheme, host and port; remove credentials, /sharing paths, query and fragment.");
         if (!Uri.TryCreate(PublicOrigin, UriKind.Absolute, out var pub) || pub.AbsolutePath != "/" ||
             pub.UserInfo.Length > 0 || pub.Query.Length > 0 || pub.Fragment.Length > 0 ||
-            (pub.Scheme != "https" && !(development && pub.IsLoopback && pub.Scheme == "http")))
-            throw new InvalidOperationException("Proxy:PublicOrigin must be your HTTPS origin (loopback HTTP allowed in Development).");
+            pub.Scheme is not ("https" or "http"))
+            throw new InvalidOperationException("Proxy:PublicOrigin must be an HTTP or HTTPS origin without credentials, path, query or fragment.");
         if (MaxUploadBytes < 1 || MaxUploadBytes > 100L << 30 || MaxDownloadBytes < 1 || MaxDownloadBytes > 1L << 40 ||
             MetadataTimeoutSeconds is < 1 or > 120 || TransferTimeoutSeconds is < 1 or > 7200 ||
             IdleTimeoutSeconds is < 1 or > 300 || SessionMinutes is < 1 or > 120 || MaxSessions is < 1 or > 4096 ||
@@ -37,18 +35,6 @@ public sealed class ProxyOptions
         return uri;
     }
 
-    private static bool LocalHttpHost(Uri uri)
-    {
-        // HTTP is an explicit local deployment option. Do not infer trust from DNS names or disable TLS for HTTPS.
-        if (uri.IsLoopback) return true;
-        if (!IPAddress.TryParse(uri.IdnHost.Trim('[', ']'), out var address)) return false;
-        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
-        var bytes = address.GetAddressBytes();
-        if (address.AddressFamily == AddressFamily.InterNetwork)
-            return bytes[0] == 10 || (bytes[0] == 172 && bytes[1] is >= 16 and <= 31)
-                || (bytes[0] == 192 && bytes[1] == 168) || (bytes[0] == 100 && bytes[1] is >= 64 and <= 127);
-        return address.AddressFamily == AddressFamily.InterNetworkV6 && (bytes[0] & 0xfe) == 0xfc;
-    }
 }
 
 public sealed class ProxyException(int status, string code) : Exception(code)

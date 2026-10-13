@@ -42,6 +42,31 @@ jobs:
       - run: node --check src/ShareProxy/wwwroot/app.js
       - run: python3 tests/http_smoke.py
       - run: docker build -t share-proxy-ci .
+      - name: Verify container startup with deployment limits
+        shell: bash
+        run: |
+          trap 'docker rm -f share-proxy-ci >/dev/null 2>&1 || true' EXIT
+          docker run -d --name share-proxy-ci \
+            --read-only --tmpfs /tmp:size=16m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            --memory 256m \
+            -p 127.0.0.1:18080:8080 \
+            -e Proxy__DsmOrigin=https://nas.example:5001 \
+            -e Proxy__PublicOrigin=https://share.example.com \
+            share-proxy-ci
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:18080/healthz >/dev/null; then
+              exit 0
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' share-proxy-ci)" != true ]; then
+              break
+            fi
+            sleep 1
+          done
+          docker logs --tail 50 share-proxy-ci
+          docker inspect --format 'Exit={{.State.ExitCode}} OOM={{.State.OOMKilled}}' share-proxy-ci
+          echo 'Container did not become ready.'
+          exit 1
 
   publish:
     needs: verify

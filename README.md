@@ -33,7 +33,7 @@ Requires a NAS with Container Manager and amd64 or arm64 support. All domains an
    MAX_DOWNLOAD_BYTES=10737418240
    ```
 
-   The DSM address must be reachable from the container, and its HTTPS certificate must match the hostname and be trusted. For a local connection to the NAS, you can use, for example, `DSM_ORIGIN=http://192.168.1.20:5000`. HTTP is allowed only on localhost or a private IP address. Localhost in a standard container refers to the container itself. The DSM address must not point back to this proxy. The public `PUBLIC_ORIGIN` must use HTTPS. Keep `.env` out of Git; no DSM username or password is configured.
+   The DSM address must be reachable from the container, and its HTTPS certificate must match the hostname and be trusted. For a local connection to the NAS, you can use, for example, `DSM_ORIGIN=http://192.168.1.20:5000`. HTTP and HTTPS are supported for any configured DSM hostname or IP address. Localhost in a standard container refers to the container itself. The origin must include http:// or https:// and the DSM port, without a /sharing path, credentials or query. The DSM address must not point back to this proxy. The public `PUBLIC_ORIGIN` accepts HTTP or HTTPS and must match the address used by visitors. Session cookies use Secure and the application sends HSTS when the public origin uses HTTPS; HTTP connections are unencrypted. Keep `.env` out of Git; no DSM username or password is configured.
 3. Open **Container Manager → Project → Create**, select the directory you created and its existing `compose.yaml`, then start the project. Compose uses the image from GHCR. The equivalent commands over SSH, run from that directory, are:
 
    ```sh
@@ -102,8 +102,6 @@ services:
     security_opt:
       - no-new-privileges:true
     mem_limit: 256m
-    cpus: 1.0
-    pids_limit: 128
     logging:
       driver: json-file
       options:
@@ -112,3 +110,16 @@ services:
 ```
 
 This example keeps all settings in Compose and does not require an `.env` file. The DSM origin is a private address reachable from the container. Configure the HTTPS reverse proxy described above with destination `http://127.0.0.1:8088`. Do not publish the container's port on all network interfaces.
+
+CPU and PID cgroup limits are omitted because some Synology kernels do not support them. The memory limit and other container restrictions remain enabled. A `Proxy started` log means the server is running and waiting for requests; the process normally stays active until it is stopped.
+
+To connect to DSM on the same Docker host without a DSM TLS certificate, add the following settings under `share-proxy` in the example above (keep the other environment settings):
+
+```yaml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      Proxy__DsmOrigin: "http://host.docker.internal:5000"
+```
+
+Docker maps this exact hostname to the host gateway through the container's hosts file. DSM must listen on port 5000 on that interface, and the NAS firewall must allow the container network. This requires Docker's `host-gateway` support; if the engine rejects it, use the NAS private IP directly. After changing environment settings, recreate the container. The public proxy origin can use HTTP or HTTPS independently of this DSM connection. See [Docker's host gateway documentation](https://docs.docker.com/reference/cli/docker/container/run/#add-host).

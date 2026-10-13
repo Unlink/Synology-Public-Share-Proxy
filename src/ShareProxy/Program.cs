@@ -62,7 +62,7 @@ app.Use(async (context, next) =>
     h["X-Robots-Tag"] = "noindex, nofollow, noarchive";
     h["Cross-Origin-Resource-Policy"] = "same-origin";
     h.CacheControl = "no-store";
-    if (!development) h.StrictTransportSecurity = "max-age=31536000";
+    if (!development && new Uri(options.PublicOrigin).Scheme == "https") h.StrictTransportSecurity = "max-age=31536000";
     try
     {
         var expected = new Uri(options.PublicOrigin);
