@@ -111,7 +111,7 @@ app.MapGet("/api/shares/{token}", async (string token, HttpContext c, SessionSto
     using var lease = store.Acquire(c);
     var gateway = store.Connection(lease.Browser, token);
     if (!await gateway.Gate.WaitAsync(0, c.RequestAborted)) throw new ProxyException(429, "share_busy");
-    try { return Results.Json((await gateway.ValidateAsync(c.RequestAborted)).Public); }
+    try { return Results.Json(await gateway.ReadPublicInfoAsync(c.RequestAborted)); }
     finally { gateway.Gate.Release(); }
 }).RequireRateLimiting("api");
 

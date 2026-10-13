@@ -66,7 +66,8 @@ async function loadShare() {
     if (state.single) {
       const file = state.info.files[0]; state.files = [file]; state.total = 1;
       $('single-file-name').textContent = file.name;
-      $('single-file-meta').textContent = [file.size == null ? '' : size(file.size), file.modified == null ? '' : date(file.modified)].filter(Boolean).join(' · ');
+      $('single-file-meta').textContent = [file.size == null ? '' : 'Veľkosť: ' + size(file.size), file.modified == null ? '' : date(file.modified)].filter(Boolean).join(' · ');
+      $('single-file-meta').hidden = !$('single-file-meta').textContent;
       $('single-file-expiry').textContent = $('expiry-text').textContent;
     } else if (state.info.mode === 'download') await loadFiles(false);
     view('share');

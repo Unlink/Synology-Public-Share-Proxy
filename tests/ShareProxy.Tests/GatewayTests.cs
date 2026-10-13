@@ -33,6 +33,29 @@ public sealed class GatewayTests
         }
     }
     private static DsmGateway Gateway(Mock mock) => new(new HttpClient(mock) { BaseAddress = new Uri(Options.DsmOrigin), Timeout = Timeout.InfiniteTimeSpan }, Options, Token);
+    [Theory]
+    [InlineData(200, "application/octet-stream", true, 10737418240L)]
+    [InlineData(405, "application/octet-stream", true, null)]
+    [InlineData(200, "text/html", true, null)]
+    [InlineData(200, "application/octet-stream", false, null)]
+    public async Task SingleFileSizeUsesOnlySuccessfulAttachmentHead(int status, string media, bool attachment, long? expected)
+    {
+        var heads = 0;
+        var mock = new Mock((request, _) =>
+        {
+            if (request.Method != HttpMethod.Head) return Task.FromResult(Standard(request, folder: false));
+            heads++;
+            Assert.Equal("/fsdownload/" + Token + "/Project", request.RequestUri!.AbsolutePath);
+            var response = Response("", media, (HttpStatusCode)status);
+            response.Content.Headers.ContentLength = 10737418240L;
+            if (attachment) response.Content.Headers.ContentDisposition = new("attachment");
+            return Task.FromResult(response);
+        });
+        using var gateway = Gateway(mock);
+        var info = await gateway.ReadPublicInfoAsync(default);
+        Assert.Equal(expected, Assert.Single(info.Files).Size);
+        Assert.Equal(1, heads);
+    }
     private static HttpResponseMessage Standard(HttpRequestMessage request, bool upload = false, bool folder = true, string protect = "none")
     {
         if (request.RequestUri!.AbsolutePath == "/sharing/" + Token) return Response(Bootstrap(protect == "password" ? "password" : "none"), "text/html");

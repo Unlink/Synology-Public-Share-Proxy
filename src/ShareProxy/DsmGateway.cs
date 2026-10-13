@@ -42,6 +42,33 @@ public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, 
         }
     }
 
+    public async Task<ShareInfo> ReadPublicInfoAsync(CancellationToken ct)
+    {
+        var state = await ValidateAsync(ct);
+        if (state.Public.Mode != "download" || state.Folder) return state.Public;
+        // Optional metadata only: HEAD never fetches the file body or follows a new endpoint.
+        // Some DSM versions do not support HEAD. Do not prevent opening the share in that case.
+        if (!await MetadataSlots.WaitAsync(0, ct)) return state.Public;
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(Math.Min(3, options.MetadataTimeoutSeconds)));
+            using var request = Request(HttpMethod.Head, "/fsdownload/" + token + "/" + Uri.EscapeDataString(state.Filename), DsmStep.Download);
+            using var response = await SendAsync(request, timeout.Token);
+            var media = response.Content.Headers.ContentType?.MediaType;
+            var length = response.Content.Headers.ContentLength;
+            if (response.StatusCode != HttpStatusCode.OK || media is "application/json" or "text/html" ||
+                response.Content.Headers.ContentDisposition?.DispositionType != "attachment" ||
+                response.Headers.Contains("X-Request-Error") || length is null or < 0) return state.Public;
+            var file = state.Public.Files[0] with { Size = length };
+            handles[file.Id] = new Handle(state.RootPath, file);
+            return state.Public with { Files = new[] { file } };
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { return state.Public; }
+        catch (HttpRequestException) { return state.Public; }
+        finally { MetadataSlots.Release(); }
+    }
+
     private void ResetSession()
     {
         sessionInitialized = false; sessionFilename = ""; unlocked = false;
