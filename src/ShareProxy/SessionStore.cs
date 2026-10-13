@@ -4,11 +4,14 @@ using System.Text;
 
 namespace ShareProxy;
 
-public sealed class SessionStore(ProxyOptions options, Uri dsmOrigin, bool development) : IDisposable
+public sealed class SessionStore(ProxyOptions options, Uri dsmOrigin, bool development, ProxyDiagnostics? diagnostics = null) : IDisposable
 {
     private readonly object sync = new();
     private readonly Dictionary<string, BrowserSession> sessions = new(StringComparer.Ordinal);
-    private readonly string cookieName = development ? "share-dev" : "__Host-ShareSession";
+    private readonly bool secureCookies = SecureCookies(options, development);
+    private readonly string cookieName = SecureCookies(options, development) ? "__Host-ShareSession" : "share-dev";
+    private static bool SecureCookies(ProxyOptions settings, bool dev) => !dev ||
+        (Uri.TryCreate(settings.PublicOrigin, UriKind.Absolute, out var publicUri) && publicUri.Scheme == "https");
     public sealed class BrowserSession
     {
         public string Id { get; } = DsmGateway.NewId();
@@ -40,7 +43,7 @@ public sealed class SessionStore(ProxyOptions options, Uri dsmOrigin, bool devel
                 sessions.Add(browser.Id, browser);
                 context.Response.Cookies.Append(cookieName, browser.Id, new CookieOptions
                 {
-                    Secure = !development, HttpOnly = true, SameSite = SameSiteMode.Strict, Path = "/", Expires = browser.Expires, IsEssential = true
+                    Secure = secureCookies, HttpOnly = true, SameSite = SameSiteMode.Strict, Path = "/", Expires = browser.Expires, IsEssential = true
                 });
             }
             browser.Active++;
@@ -64,8 +67,11 @@ public sealed class SessionStore(ProxyOptions options, Uri dsmOrigin, bool devel
                 ConnectTimeout = TimeSpan.FromSeconds(10), PooledConnectionLifetime = TimeSpan.FromMinutes(5),
                 MaxConnectionsPerServer = 2, AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
             };
+            var certificate = diagnostics == null ? null : new DsmCertificateObserver();
+            if (certificate != null)
+                handler.SslOptions.RemoteCertificateValidationCallback = (_, _, chain, errors) => certificate.Validate(chain, errors);
             var client = new HttpClient(handler) { BaseAddress = dsmOrigin, Timeout = Timeout.InfiniteTimeSpan };
-            gateway = new DsmGateway(client, options, token);
+            gateway = new DsmGateway(client, options, token, diagnostics, certificate);
             browser.Connections.Add(key, gateway);
             return gateway;
         }

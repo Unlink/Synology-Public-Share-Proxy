@@ -9,8 +9,6 @@ RUN dotnet publish src/ShareProxy/ShareProxy.csproj -c Release --no-restore -o /
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY deploy/ca/ /usr/local/share/ca-certificates/
-RUN update-ca-certificates
 WORKDIR /app
 COPY --from=build /app/publish .
 ENV ASPNETCORE_HTTP_PORTS=8080 ASPNETCORE_ENVIRONMENT=Production DOTNET_EnableDiagnostics=0

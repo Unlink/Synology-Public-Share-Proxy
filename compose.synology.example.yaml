@@ -1,0 +1,32 @@
+services:
+  share-proxy:
+    image: ghcr.io/unlink/synology-public-share-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8088:8080"
+    environment:
+      Proxy__DsmOrigin: "http://192.168.1.20:5000"
+      Proxy__PublicOrigin: "https://share.example.com"
+      Proxy__UploadsEnabled: "true"
+      Proxy__PasswordLoginEnabled: "true"
+      Proxy__MaxUploadBytes: "1073741824"
+      Proxy__MaxDownloadBytes: "10737418240"
+      Proxy__MaxConcurrentTransfers: "4"
+      Proxy__TransferTimeoutSeconds: "1800"
+      Proxy__IdleTimeoutSeconds: "60"
+      Proxy__DiagnosticsVerbose: "false"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

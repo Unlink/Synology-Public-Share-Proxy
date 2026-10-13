@@ -8,14 +8,18 @@ using Microsoft.AspNetCore.WebUtilities;
 
 namespace ShareProxy;
 
-public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, string shareToken) : IDisposable
+public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, string shareToken, ProxyDiagnostics? diagnostics = null,
+    DsmCertificateObserver? certificate = null) : IDisposable
 {
     private readonly string token = Input.Token(shareToken);
     private readonly Dictionary<string, Handle> handles = new(StringComparer.Ordinal);
     private static int globalHandles;
+    private static readonly SemaphoreSlim MetadataSlots = new(8, 8);
     private const int GlobalHandleLimit = 32768;
     private string? currentRoot;
     private bool unlocked;
+    private bool sessionInitialized;
+    private string sessionFilename = "";
     public SemaphoreSlim Gate { get; } = new(1, 1);
     private sealed record Handle(string Path, PublicFile File);
     private const string Entry = "/sharing/webapi/entry.cgi";
@@ -26,8 +30,29 @@ public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, 
 
     public async Task<ShareState> ValidateAsync(CancellationToken ct)
     {
+        try
+        {
+            await EnsureSessionAsync(ct);
+            return await ReadShareStateAsync(ct);
+        }
+        catch (ProxyException error) when (error.Status is 401 or 410)
+        {
+            ResetSession();
+            throw;
+        }
+    }
+
+    private void ResetSession()
+    {
+        sessionInitialized = false; sessionFilename = ""; unlocked = false;
+        currentRoot = null; ClearHandles();
+    }
+
+    private async Task EnsureSessionAsync(CancellationToken ct)
+    {
+        if (sessionInitialized) return;
         // Read only the bootstrap URL. Never execute or return DSM HTML, scripts, assets or URLs.
-        using var page = Request(HttpMethod.Get, "/sharing/" + token);
+        using var page = Request(HttpMethod.Get, "/sharing/" + token, DsmStep.Bootstrap);
         var html = await TextAsync(page, ct);
         var status = BootstrapStatus(html, token);
         if (status == "user") throw new ProxyException(403, "account_share_unsupported");
@@ -37,7 +62,7 @@ public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, 
         {
             ["api"] = "SYNO.Core.Sharing.Session", ["method"] = "get", ["version"] = "1",
             ["sharing_id"] = JsonSerializer.Serialize(token), ["sharing_status"] = JsonSerializer.Serialize(status)
-        }));
+        }), DsmStep.ShareSession);
         var (session, extra) = ParseSession(await TextAsync(sessionReq, ct));
         using (session) using (extra)
         {
@@ -47,47 +72,56 @@ public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, 
             if (!e.TryGetProperty("status", out var statusValue) || !statusValue.TryGetInt32(out var statusCode))
                 throw new ProxyException(502, "protocol_error");
             if (statusCode != 0) throw new ProxyException(410, "unavailable");
-            using var init = await ApiAsync("SYNO.Core.Sharing.Initdata", "get", 1, [], ct);
-            var data = init.RootElement.GetProperty("data");
-            var sharing = data.GetProperty("Sharing");
-            if (!Bool(sharing, "enabled")) throw new ProxyException(410, "unavailable");
-            var protect = Str(sharing, "protect_type");
-            if (protect == "password" && !unlocked) throw new ProxyException(401, "password_required");
-            if (protect is not ("none" or "password")) throw new ProxyException(403, "account_share_unsupported");
-            if (Str(sharing, "redirect_type") != "none") throw new ProxyException(403, "unsupported_share");
-            // These features depend on visitor IP / visit counting; the proxy has its own upstream IP.
-            // Deny rather than silently change their semantics or cache away DSM enforcement.
-            if (Bool(sharing, "enable_match_ip") || Number(sharing, "expire_times") > 0)
-                throw new ProxyException(403, "restricted_share_unsupported");
-            var app = sharing.GetProperty("app");
-            if (!app.TryGetProperty("enable_upload", out var uploadFlag) || uploadFlag.ValueKind is not (JsonValueKind.True or JsonValueKind.False)
-                || !app.TryGetProperty("is_folder", out var folderFlag) || folderFlag.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
-                throw new ProxyException(502, "protocol_error");
-            var upload = Bool(app, "enable_upload");
-            var folder = Bool(app, "is_folder");
-            var privateData = data.TryGetProperty("Private", out var pd) ? pd : default;
-            var filename = Str(privateData, "filename");
-            if (filename.Length == 0) filename = Str(e, "filename");
-            var title = upload ? Str(app, "request_name") : filename;
-            if (!upload) Input.Filename(filename);
-            var root = upload ? "" : Input.SafePath("/" + filename);
-            if (currentRoot != root) { ClearHandles(); currentRoot = root; }
-            var files = !upload && !folder ? new[] { Remember(root, filename, false, null, null) } : [];
-            return new ShareState(new ShareInfo(title.Length > 0 ? title : "Zdieľané súbory", upload ? Str(app, "request_info") : "",
-                upload ? "upload" : "download", NullIfEmpty(Str(sharing, "expire_at")), protect == "password", options.MaxUploadBytes, files), root, filename, folder);
+            sessionFilename = Str(e, "filename");
+            sessionInitialized = true;
         }
+    }
+
+    private async Task<ShareState> ReadShareStateAsync(CancellationToken ct)
+    {
+        // Never cache authorization: DSM rechecks expiry, protection, mode and permissions on every operation.
+        using var init = await ApiAsync("SYNO.Core.Sharing.Initdata", "get", 1, [], ct);
+        var data = init.RootElement.GetProperty("data");
+        var sharing = data.GetProperty("Sharing");
+        if (!Bool(sharing, "enabled")) throw new ProxyException(410, "unavailable");
+        var protect = Str(sharing, "protect_type");
+        if (protect == "password" && !unlocked) throw new ProxyException(401, "password_required");
+        if (protect is not ("none" or "password")) throw new ProxyException(403, "account_share_unsupported");
+        if (Str(sharing, "redirect_type") != "none") throw new ProxyException(403, "unsupported_share");
+        // enable_match_ip=true also occurs in every captured ordinary public share. It is not
+        // sufficient evidence of a visitor ACL. Keep the isolated DSM session on one upstream.
+        // Visit-count-limited links remain unsupported because validation makes extra DSM requests.
+        if (Number(sharing, "expire_times") > 0)
+            throw new ProxyException(403, "restricted_share_unsupported");
+        var app = sharing.GetProperty("app");
+        if (!app.TryGetProperty("enable_upload", out var uploadFlag) || uploadFlag.ValueKind is not (JsonValueKind.True or JsonValueKind.False)
+            || !app.TryGetProperty("is_folder", out var folderFlag) || folderFlag.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            throw new ProxyException(502, "protocol_error");
+        var upload = Bool(app, "enable_upload");
+        var folder = Bool(app, "is_folder");
+        var privateData = data.TryGetProperty("Private", out var pd) ? pd : default;
+        var filename = Str(privateData, "filename");
+        if (filename.Length == 0) filename = sessionFilename;
+        var title = upload ? Str(app, "request_name") : filename;
+        if (!upload) Input.Filename(filename);
+        var root = upload ? "" : Input.SafePath("/" + filename);
+        if (currentRoot != root) { ClearHandles(); currentRoot = root; }
+        var files = !upload && !folder ? new[] { Remember(root, filename, false, null, null) } : [];
+        return new ShareState(new ShareInfo(title.Length > 0 ? title : "Zdieľané súbory", upload ? Str(app, "request_info") : "",
+            upload ? "upload" : "download", NullIfEmpty(Str(sharing, "expire_at")), protect == "password", options.MaxUploadBytes, files), root, filename, folder);
     }
 
     public async Task UnlockAsync(string password, CancellationToken ct)
     {
         if (!options.PasswordLoginEnabled) throw new ProxyException(403, "password_login_disabled");
         if (password.Length is < 1 or > 1024 || password.Any(char.IsControl)) throw new ProxyException(400, "invalid_password");
+        ResetSession();
         // Only public share passwords; the request schema has no account/user/login fields.
-        using var page = Request(HttpMethod.Get, "/sharing/" + token);
+        using var page = Request(HttpMethod.Get, "/sharing/" + token, DsmStep.Bootstrap);
         var status = BootstrapStatus(await TextAsync(page, ct), token);
         if (status != "password") throw new ProxyException(403, "unsupported_share");
         using var encryption = await ApiAsync("SYNO.API.Encryption", "getinfo", 1,
-            new() { ["format"] = "module" }, ct, Entry + "/SYNO.API.Encryption");
+            new() { ["format"] = "module" }, ct, "/sharing/webapi/encryption.cgi/SYNO.API.Encryption");
         var cipher = DsmEncryption.Encrypt(encryption.RootElement.GetProperty("data"), token, password);
         using var login = await ApiAsync("SYNO.Core.Sharing.Login", "login", 1,
             new() { ["__cIpHeRtExT"] = cipher }, ct, Entry + "/SYNO.Core.Sharing.Login", true);
@@ -144,27 +178,38 @@ public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, 
         var state = await ValidateAsync(ct);
         if (state.Public.Mode != "download") throw new ProxyException(403, "download_not_allowed");
         var selection = ids.Select(id => Find(id, state.RootPath)).ToArray();
+        var singleFile = selection.Length == 1 && !selection[0].File.IsDirectory;
+        var downloadName = singleFile ? selection[0].File.Name : "shared-files.zip";
         using var req = state.Folder
-            ? Request(HttpMethod.Post, "/fsdownload/webapi/file_download.cgi/shared-files.zip", new FormUrlEncodedContent(new Dictionary<string, string>
+            ? singleFile
+                // Captured File Station DirectDownload: dlink is the UTF-8 path in hex,
+                // JSON-string encoded. It is built only from this session's validated handle.
+                ? Request(HttpMethod.Get, "/fsdownload/webapi/file_download.cgi/" + Uri.EscapeDataString(downloadName) + "?" + Encode(new Dictionary<string, string>
+                {
+                    ["dlink"] = JsonSerializer.Serialize(Convert.ToHexString(Encoding.UTF8.GetBytes(selection[0].Path)).ToLowerInvariant()),
+                    ["_sharing_id"] = JsonSerializer.Serialize(token), ["api"] = "SYNO.FolderSharing.Download",
+                    ["version"] = "2", ["method"] = "download", ["mode"] = "download", ["stdhtml"] = "false"
+                }), DsmStep.Download)
+                : Request(HttpMethod.Post, "/fsdownload/webapi/file_download.cgi/shared-files.zip", DsmStep.Download, new FormUrlEncodedContent(new Dictionary<string, string>
             {
                 ["api"] = "SYNO.FolderSharing.Download", ["method"] = "download", ["version"] = "2",
                 ["mode"] = "\"download\"", ["stdhtml"] = "false", ["dlname"] = "\"shared-files.zip\"",
                 ["path"] = JsonSerializer.Serialize(selection.Select(x => x.Path)), ["_sharing_id"] = JsonSerializer.Serialize(token), ["codepage"] = "\"enu\""
             }))
-            : Request(HttpMethod.Get, "/fsdownload/" + token + "/" + Uri.EscapeDataString(state.Filename));
+            : Request(HttpMethod.Get, "/fsdownload/" + token + "/" + Uri.EscapeDataString(state.Filename), DsmStep.Download);
         using var transfer = CancellationTokenSource.CreateLinkedTokenSource(ct);
         transfer.CancelAfter(TimeSpan.FromSeconds(options.TransferTimeoutSeconds));
-        using var response = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, transfer.Token);
+        using var response = await SendAsync(req, transfer.Token);
         CheckStatus(response);
         var media = response.Content.Headers.ContentType?.MediaType;
         // Require DSM's attachment response, so HTML/login/error pages cannot masquerade as files.
-        if (response.Content.Headers.ContentDisposition?.DispositionType != "attachment" || media is "application/json" or "text/html")
+        if (media is "application/json" or "text/html")
             throw new ProxyException(502, "download_rejected");
         var length = response.Content.Headers.ContentLength;
         if (length > options.MaxDownloadBytes) throw new ProxyException(413, "transfer_too_large");
         output.ContentType = "application/octet-stream";
         var disposition = new Microsoft.Net.Http.Headers.ContentDispositionHeaderValue("attachment");
-        disposition.SetHttpFileName(state.Folder ? "shared-files.zip" : state.Filename);
+        disposition.SetHttpFileName(downloadName);
         output.Headers.ContentDisposition = disposition.ToString();
         if (length.HasValue) output.ContentLength = length;
         await using var stream = await response.Content.ReadAsStreamAsync(transfer.Token);
@@ -183,26 +228,48 @@ public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, 
             ["filename"] = JsonSerializer.Serialize(filename), ["size"] = length.ToString(), ["overwrite"] = "false",
             ["sharing_id"] = JsonSerializer.Serialize(token), ["uploader_name"] = JsonSerializer.Serialize(uploader)
         }, ct);
-        using var form = new MultipartFormDataContent();
-        // The multipart data fields in this API are raw strings. The query _sharing_id is JSON encoded.
+        using var form = new MultipartFormDataContent("----ShareProxy" + Guid.NewGuid().ToString("N"));
+        form.HeaderEncodingSelector = (_, _) => Encoding.UTF8;
+        // Match the captured browser wire format rather than .NET's defaults:
+        // unquoted boundary parameter, quoted disposition names, no field Content-Type.
+        var boundary = form.Headers.ContentType!.Parameters.Single(p => p.Name == "boundary");
+        boundary.Value = boundary.Value!.Trim('"');
+        // Native upload uses raw strings in both multipart fields and query _sharing_id.
+        // Unlike the Sharing metadata APIs and ZIP download, this query value is NOT JSON encoded.
         foreach (var pair in new Dictionary<string, string>
         {
-            ["overwrite"] = "false", ["mtime"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(),
+            ["overwrite"] = "false", ["mtime"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(),
             ["sharing_id"] = token, ["uploader_name"] = uploader, ["size"] = length.ToString()
-        }) form.Add(new StringContent(pair.Value, Encoding.UTF8), pair.Key);
+        })
+        {
+            var field = new StringContent(pair.Value, Encoding.UTF8);
+            field.Headers.ContentType = null;
+            field.Headers.ContentDisposition = new ContentDispositionHeaderValue("form-data") { Name = "\"" + pair.Key + "\"" };
+            form.Add(field);
+        }
         using var content = new UploadContent(body, length, options.IdleTimeoutSeconds);
+        // Filename was validated above (no quotes, slashes or control characters). Browser-style
+        // UTF-8 avoids .NET's MIME encoded-word / filename* variants unsupported by some DSM parsers.
+        // DSM's native upload parser requires Content-Disposition FIRST. Reversed header order
+        // caused a ~10s wait and code 401 on the real NAS even though all binary bytes were sent.
+        content.Headers.TryAddWithoutValidation("Content-Disposition", "form-data; name=\"file\"; filename=\"" + filename + "\"");
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        form.Add(content, "file", filename); // Binary MUST be the final part.
+        form.Add(content); // Binary MUST be the final part.
         using var req = Request(HttpMethod.Post, "/webapi/entry.cgi?" + Encode(new Dictionary<string, string>
         {
-            ["api"] = "SYNO.FileStation.Upload", ["method"] = "upload", ["version"] = "2", ["_sharing_id"] = JsonSerializer.Serialize(token)
-        }), form);
+            ["api"] = "SYNO.FileStation.Upload", ["method"] = "upload", ["version"] = "2", ["_sharing_id"] = token
+        }), DsmStep.Upload, form);
+        // Captured native File Request upload uses _sharing_id, not X-SYNO-SHARING (the latter
+        // belongs to /sharing/webapi). Derive browser context only from the fixed DSM origin.
+        req.Headers.Remove("X-SYNO-SHARING");
+        req.Headers.Add("Origin", client.BaseAddress!.GetLeftPart(UriPartial.Authority));
+        req.Headers.Referrer = new Uri(client.BaseAddress, "/sharing/" + token);
         using var transfer = CancellationTokenSource.CreateLinkedTokenSource(ct);
         transfer.CancelAfter(TimeSpan.FromSeconds(options.TransferTimeoutSeconds));
-        using var response = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, transfer.Token);
+        using var response = await SendUploadAsync(req, content, length, transfer.Token);
         CheckStatus(response);
         using var result = JsonDocument.Parse(await ReadLimitedAsync(response, transfer.Token));
-        CheckApi(result.RootElement, false);
+        CheckApi(result.RootElement, false, upload: true);
     }
 
     private PublicFile Remember(string path, string name, bool directory, long? size, long? modified)
@@ -222,8 +289,9 @@ public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, 
     private Handle Find(string id, string root) => Input.Id(id) && handles.TryGetValue(id, out var handle) && Input.Within(handle.Path, root)
         ? handle : throw new ProxyException(404, "file_not_found");
 
-    private HttpRequestMessage Request(HttpMethod method, string path, HttpContent? body = null)
+    private HttpRequestMessage Request(HttpMethod method, string path, DsmStep step, HttpContent? body = null)
     {
+        diagnostics?.Step(step);
         // Only callsites in this class choose the path; no URL or endpoint comes from a visitor/DSM response.
         var request = new HttpRequestMessage(method, new Uri(client.BaseAddress!, path)) { Content = body };
         request.Headers.Add("X-SYNO-SHARING", token);
@@ -238,18 +306,53 @@ public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, 
             or ("SYNO.Core.Sharing.Login", "login", 1) or ("SYNO.FolderSharing.List", "list", 2)
             or ("SYNO.FileStation.CheckPermission", "write", 3))) throw new ProxyException(404, "unavailable");
         args["api"] = api; args["method"] = method; args["version"] = version.ToString();
-        using var req = Request(HttpMethod.Post, path, new FormUrlEncodedContent(args));
-        var document = JsonDocument.Parse(await TextAsync(req, ct));
+        var step = api switch
+        {
+            "SYNO.Core.Sharing.Initdata" => DsmStep.InitData,
+            "SYNO.API.Encryption" => DsmStep.EncryptionInfo,
+            "SYNO.Core.Sharing.Login" => DsmStep.Unlock,
+            "SYNO.FolderSharing.List" => DsmStep.ListFiles,
+            "SYNO.FileStation.CheckPermission" => DsmStep.UploadPermission,
+            _ => DsmStep.None
+        };
+        using var req = Request(HttpMethod.Post, path, step, new FormUrlEncodedContent(args));
+        // Password bootstrap APIs precede share authorization. DSM rejects the sharing
+        // header here with code 126; captured browser requests omit it for both calls.
+        if (step is DsmStep.EncryptionInfo or DsmStep.Unlock) req.Headers.Remove("X-SYNO-SHARING");
+        var responseText = await TextAsync(req, ct);
+        var document = JsonDocument.Parse(responseText);
         try { CheckApi(document.RootElement, login); return document; }
         catch { document.Dispose(); throw; }
     }
     private async Task<string> TextAsync(HttpRequestMessage request, CancellationToken ct)
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(TimeSpan.FromSeconds(options.MetadataTimeoutSeconds));
-        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
-        CheckStatus(response);
-        return await ReadLimitedAsync(response, timeout.Token);
+        // Bound aggregate metadata buffering across visitors; transfers remain streamed.
+        if (!await MetadataSlots.WaitAsync(0, ct)) throw new ProxyException(429, "server_busy");
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(options.MetadataTimeoutSeconds));
+            using var response = await SendAsync(request, timeout.Token);
+            CheckStatus(response);
+            return await ReadLimitedAsync(response, timeout.Token);
+        }
+        finally { MetadataSlots.Release(); }
+    }
+    private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    {
+        certificate?.Reset();
+        try
+        {
+            var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            diagnostics?.Response(response);
+            return response;
+        }
+        finally { diagnostics?.Certificate(certificate?.Observation); }
+    }
+    private async Task<HttpResponseMessage> SendUploadAsync(HttpRequestMessage request, UploadContent content, long length, CancellationToken ct)
+    {
+        try { return await SendAsync(request, ct); }
+        finally { diagnostics?.UploadBytes(content.BytesSent, length); }
     }
     private static async Task<string> ReadLimitedAsync(HttpResponseMessage response, CancellationToken ct)
     {
@@ -259,22 +362,28 @@ public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, 
         await TransferIO.CopyAsync(stream, buffer, 4 * 1024 * 1024, 20, ct);
         return Encoding.UTF8.GetString(buffer.GetBuffer(), 0, (int)buffer.Length);
     }
-    private static void CheckStatus(HttpResponseMessage response)
+    private void CheckStatus(HttpResponseMessage response)
     {
         if ((int)response.StatusCode is >= 300 and < 400) throw new ProxyException(502, "upstream_redirect_rejected");
-        if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Gone) throw new ProxyException(410, "unavailable");
-        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) throw new ProxyException(401, "password_required");
+        if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Gone)
+        { ResetSession(); throw new ProxyException(410, "unavailable"); }
+        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        { ResetSession(); throw new ProxyException(401, "password_required"); }
         if (response.StatusCode != HttpStatusCode.OK) throw new ProxyException(502, "upstream_error");
         if (response.Headers.TryGetValues("X-Request-Error", out var values) && values.Contains("errorhash")) throw new ProxyException(502, "upstream_error");
     }
-    private static void CheckApi(JsonElement json, bool login)
+    private void CheckApi(JsonElement json, bool login, bool upload = false)
     {
         if (!Bool(json, "success"))
         {
-            if (login) throw new ProxyException(401, "invalid_password");
             var error = json.TryGetProperty("error", out var e) ? e : default;
             var code = Number(error, "code");
-            throw code is 106 or 107 or 119 ? new ProxyException(401, "password_required") : new ProxyException(403, "operation_rejected");
+            diagnostics?.ApiError(code, error);
+            if (login) throw new ProxyException(401, "invalid_password");
+            if (code is 106 or 107 or 119)
+            { ResetSession(); throw new ProxyException(401, "password_required"); }
+            if (upload) throw new ProxyException(502, "upload_failed");
+            throw new ProxyException(403, "operation_rejected");
         }
     }
     public static string BootstrapStatus(string html, string token)
@@ -285,9 +394,12 @@ public sealed partial class DsmGateway(HttpClient client, ProxyOptions options, 
             var queryAt = src.IndexOf('?');
             if (queryAt < 0) continue;
             var q = QueryHelpers.ParseQuery(src[(queryAt + 1)..]);
-            if (q["api"] != "SYNO.Core.Sharing.Session") continue;
-            if (JsonSerializer.Deserialize<string>(q["sharing_id"].ToString()) != token) throw new ProxyException(502, "protocol_error");
-            return JsonSerializer.Deserialize<string>(q["sharing_status"].ToString()) ?? throw new ProxyException(502, "protocol_error");
+            if (!q.TryGetValue("api", out var api) || api != "SYNO.Core.Sharing.Session") continue;
+            if (api.Count != 1 || !q.TryGetValue("sharing_id", out var id) || id.Count != 1
+                || !q.TryGetValue("sharing_status", out var status) || status.Count != 1)
+                throw new ProxyException(502, "protocol_error");
+            if (JsonSerializer.Deserialize<string>(id.ToString()) != token) throw new ProxyException(502, "protocol_error");
+            return JsonSerializer.Deserialize<string>(status.ToString()) ?? throw new ProxyException(502, "protocol_error");
         }
         throw new ProxyException(410, "unavailable");
     }

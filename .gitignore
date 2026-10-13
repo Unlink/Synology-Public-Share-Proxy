@@ -13,3 +13,6 @@ work/
 .vs/
 *.user
 *.log
+**/appsettings.*.json
+*.cer
+*.har.*

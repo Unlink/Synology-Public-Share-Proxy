@@ -1,7 +1,6 @@
 services:
   share-proxy:
-    build: .
-    image: synology-public-share-proxy:local
+    image: ${PROXY_IMAGE:-ghcr.io/unlink/synology-public-share-proxy:latest}
     restart: unless-stopped
     ports:
       - "127.0.0.1:${PROXY_PORT:-8088}:8080"
@@ -15,6 +14,7 @@ services:
       Proxy__MaxConcurrentTransfers: ${MAX_CONCURRENT_TRANSFERS:-4}
       Proxy__TransferTimeoutSeconds: ${TRANSFER_TIMEOUT_SECONDS:-1800}
       Proxy__IdleTimeoutSeconds: ${IDLE_TIMEOUT_SECONDS:-60}
+      Proxy__DiagnosticsVerbose: ${DIAGNOSTICS_VERBOSE:-false}
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

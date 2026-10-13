@@ -1,113 +1,114 @@
 # Synology Public Share Proxy
 
-Samostatné verejné rozhranie pre **File Station download odkazy a anonymné File Request uploady**. ASP.NET Core 10 Minimal API + čisté HTML/CSS/JavaScript. Zdieľanie, súbory, heslá a oprávnenia zostávajú v Synology. Proxy nepotrebuje DSM účet, API kľúč ani pripojenie súborových zväzkov.
+Public File Station download links and anonymous File Request uploads through a dedicated interface. Built with ASP.NET Core Minimal API and vanilla JavaScript. DSM manages files, passwords and permissions; the application does not require a DSM account or a mounted file volume.
 
-Projekt je implementovaný podľa používateľových DSM 7.3 HAR záznamov. **Testy a lokálne UI QA prešli; tento build zatiaľ nebol spustený proti fyzickému DSM.** Pred verejným nasadením vykonajte [overenie na DSM](docs/DSM-VALIDATION.md). Docker build je súčasťou CI; lokálne nebol dostupný Docker daemon.
+[API documentation](docs/API.md)
 
-## Čo funguje
+## Docker image
 
-- Zoznam súborov, prechádzanie priečinkov, stránkovanie, hľadanie v načítaných položkách a zoradenie názvov.
-- Výber súborov/priečinkov a download cez natívny Synology ZIP stream; samostatný súbor cez natívny `fsdownload`.
-- Verejné zdieľanie s heslom: zachytené Synology RSA/AES šifrovanie, izolované cookies a relácia iba pre príslušný odkaz.
-- File Request: výber alebo drag-and-drop, fronta, progres, zrušenie, opakovanie a potvrdenie uloženia od DSM.
-- Mobilné rozhranie, popisy ovládacích prvkov, klávesnicový výber, živé stavy, viditeľné zameranie a obmedzená animácia.
-- Chybový/expiračný stav. Platnosť sa znovu overuje pred každým zoznamom, downloadom a uploadom.
-- Streamovanie bez ukladania kópií na disk proxy; pevný DSM origin, TLS validácia, limity veľkosti/času/súbehu, rate limiting, CSRF a bezpečnostné hlavičky.
-
-Rozhranie je navrhnuté v duchu File Station. Nepoužíva Synology JavaScript, CSS, fonty, obrázky, logo ani iné proprietárne assety.
-
-## Hranice podpory
-
-Podporované sú verejné odkazy bez hesla alebo s heslom. Odkazy vyžadujúce DSM účet, interné používateľské prihlásenie, IP binding, limit počtu návštev, redirect typ a ďalšie aplikácie (Drive, Photos, administrácia) sa odmietajú. IP binding a počítadlá by cez proxy menili svoju sémantiku. Časovú expiráciu a prístupové oprávnenia naďalej vynucuje DSM.
-
-Naraz možno stiahnuť najviac 100 vybraných položiek. Veľký vnorený priečinok možno vybrať ako jednu položku z jeho nadradeného priečinka. Tlačidlo „Stiahnuť všetko“ vyžaduje načítanie všetkých položiek aktuálneho priečinka. Na jeden odkaz v relácii je limit 4 096 evidovaných položiek; nová relácia vyprázdni evidenciu. Konzervatívna validácia odmieta problematické názvy/cesty vrátane riadiacich znakov, lomiek, `%` v cestách a segmentov `.`/`..`.
-
-Upload nikdy úmyselne neprepisuje existujúce súbory (`overwrite=false`); konflikt rieši DSM. Po zrušení prenosu môže DSM mať čiastočný alebo už dokončený súbor. Proxy ho nemaže a neskúša zrušenie automaticky opakovať. Fronta existuje iba v pamäti otvorenej stránky.
-
-## Rýchle nasadenie na Synology
-
-Vyžaduje Synology s Container Manager a podporovaným `linux/amd64` alebo `linux/arm64`. Image používa [.NET 10 runtime](https://github.com/dotnet/dotnet-docker/blob/main/README.aspnet.md). Pre konkrétny NAS model je potrebné potvrdiť podporu architektúry a kontajnerov.
-
-1. Uložte zdrojový priečinok do napr. `/volume1/docker/synology-public-share-proxy`.
-2. Skopírujte `.env.example` ako `.env` a nastavte:
-   - `DSM_ORIGIN`: interný HTTPS origin DSM dostupný **z kontajnera**, napr. `https://nas.home.example:5001`. Certifikát musí mať zodpovedajúci hostname a dôveryhodný reťazec. Táto adresa nesmie smerovať späť na proxy.
-   - `PUBLIC_ORIGIN`: presný verejný HTTPS origin, napr. `https://share.example.com`, bez cesty.
-3. Ak používate internú CA, vložte iba jej verejný `.crt` certifikát do `deploy/ca/` pred buildom. Dockerfile ho zaradí medzi dôveryhodné CA. Súkromný kľúč sa nepoužíva. Overovanie TLS nemožno vypnúť.
-4. V Container Manager → Project vytvorte projekt z tohto adresára a súboru `compose.yaml`; spustite build a kontajner. Ekvivalent cez terminál:
-
-   ```sh
-   docker compose up -d --build
-   docker compose ps
-   ```
-
-5. V DSM → Control Panel → Login Portal → Advanced → Reverse Proxy nastavte zdroj `HTTPS`, `share.example.com`, port `443`; cieľ `HTTP`, `127.0.0.1`, port `8088`.
-6. Priraďte verejný certifikát k tejto doméne. Zachovajte HTTP `Host: share.example.com` a `Origin`. Proxy host kontroluje; nesprávny Host dá `400`.
-7. Limit request body reverse proxy nastavte aspoň na `MAX_UPLOAD_BYTES` a timeouty na `TRANSFER_TIMEOUT_SECONDS`. Vypnite upload/download buffering, ak to vaša spravovaná konfigurácia podporuje. [Ukážka nginx](deploy/nginx.example.conf) je určená pre nginx, ktorý spravujete; neupravujte systémové DSM súbory, ktoré DSM prepisuje.
-8. Verejná doména musí smerovať iba na túto aplikáciu. DSM porty `5000/5001`, Drive a administráciu neotvárajte cez túto doménu. Proxy kontajner nevyžaduje privilegovaný režim ani volume so súbormi NAS.
-
-Web Station môže poslúžiť ako frontend reverznej proxy pre tento kontajner. C# aplikácia beží v kontajneri na porte 8080; konfigurácia nie je PHP webroot. HTTPS verejnej stránky a HTTPS upstream DSM sú dve oddelené spojenia. Na HTTP cieľ reverse proxy neposielajte HTTPS a na HTTPS port DSM neposielajte HTTP.
-
-Compose zverejňuje port iba na host loopback; pri reverznej proxy na inom stroji ho vystavte iba na dôveryhodnej internej adrese a obmedzte firewallom. Reverse proxy má byť jediná verejná cesta. Štandardný per-IP limiter vidí IP reverznej proxy: `X-Forwarded-For` sa nepreberá, aby ho návštevník nemohol podvrhnúť. Pre veľký počet návštevníkov pridajte per-client rate limiting na dôveryhodnú reverznú proxy; neodstraňujte globálny limiter.
-
-## Ako poslať verejný odkaz
-
-Vytvorte share alebo File Request v DSM File Station ako doteraz. Zachovajte token a cestu, zmeňte iba verejný host:
+After successful checks, the workflow in `.github/workflows/docker.yaml` publishes images for `linux/amd64` and `linux/arm64`:
 
 ```text
-Pôvodné: https://nas.home.example:5001/sharing/EXAMPLE123
-Verejné: https://share.example.com/sharing/EXAMPLE123
+ghcr.io/unlink/synology-public-share-proxy:latest
 ```
 
-`EXAMPLE123` je vymyslený príklad. Funguje aj `/s/<token>`. Návštevník nedostáva DSM HTML, admin/login stránku, upstream URL, DSM cookie ani filesystem cestu. Krátke `gofile.me` redirecty sa nepreberajú; použite priamy File Station odkaz. Konfigurácia external domain a automatické generovanie proxy linkov sa v DSM nemení programovo.
+A push to the default branch updates `latest` and creates a `sha-<commit>` tag. A `v1.2.3` tag creates versions `1.2.3` and `1.2`. You can also run the workflow manually through GitHub Actions from the default branch. Pull requests run checks only. Publishing uses the automatic `GITHUB_TOKEN`, so a personal access token is not required. To allow image pulls without authentication, set the package visibility to Public in GitHub Packages after the first publication. For a private package, Container Manager must authenticate with GHCR.
 
-## Limity a nastavenia
+Details: [publishing images to GHCR](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images).
 
-| Nastavenie | Predvolené |
-| --- | --- |
-| `Proxy__MaxUploadBytes` | 1 GiB na súbor |
-| `Proxy__MaxDownloadBytes` | 10 GiB na stream |
-| `Proxy__MaxConcurrentTransfers` | 4 pre celý proces |
-| `Proxy__TransferTimeoutSeconds` | 1 800 |
-| `Proxy__MetadataTimeoutSeconds` | 20 |
-| `Proxy__IdleTimeoutSeconds` | 60 |
-| `Proxy__SessionMinutes` | 30, absolútna platnosť |
-| `Proxy__MaxSessions` | 256 návštevníkov |
-| `Proxy__UploadsEnabled` | true |
-| `Proxy__PasswordLoginEnabled` | true |
+## Synology deployment example
 
-Jedna relácia otvorí najviac 8 share tokenov, každý má oddelený HTTP klient/cookie store. Celkový počet spojení k DSM je obmedzený na `MaxSessions` (predvolene 256). Identifikátory súborov majú limit 4 096 na odkaz a 32 768 za celý proces. Súbežné operácie na tom istom odkaze vrátia `429`, ktoré UI vysvetlí; upload fronta posiela súbory postupne. Restart ruší relácie a návštevníci zadajú heslo znova. Pri neznámej dĺžke downloadu sa limit kontroluje počas čítania; už začatý príliš veľký alebo chybný stream sa preruší. Download sa neukladá do pamäte JavaScriptu. Resume/range, preview a thumbnail API sú zatiaľ mimo rozsahu.
+Requires a NAS with Container Manager and amd64 or arm64 support. All domains and IP addresses below are placeholders; replace them with your own values.
 
-## Vývoj, testy a lokálny náhľad
+1. Create the directory `/volume1/docker/synology-public-share-proxy`. Place `compose.yaml` from this repository in it and copy `.env.example` to `.env`.
+2. Configure `.env`, for example:
+
+   ```dotenv
+   DSM_ORIGIN=https://nas.example.com:5001
+   PUBLIC_ORIGIN=https://share.example.com
+   PROXY_PORT=8088
+   UPLOADS_ENABLED=true
+   PASSWORD_LOGIN_ENABLED=true
+   MAX_UPLOAD_BYTES=1073741824
+   MAX_DOWNLOAD_BYTES=10737418240
+   ```
+
+   The DSM address must be reachable from the container, and its HTTPS certificate must match the hostname and be trusted. For a local connection to the NAS, you can use, for example, `DSM_ORIGIN=http://192.168.1.20:5000`. HTTP is allowed only on localhost or a private IP address. Localhost in a standard container refers to the container itself. The DSM address must not point back to this proxy. The public `PUBLIC_ORIGIN` must use HTTPS. Keep `.env` out of Git; no DSM username or password is configured.
+3. Open **Container Manager → Project → Create**, select the directory you created and its existing `compose.yaml`, then start the project. Compose uses the image from GHCR. The equivalent commands over SSH, run from that directory, are:
+
+   ```sh
+   docker compose pull
+   docker compose up -d
+   ```
+
+4. In **Control Panel → Login Portal → Advanced → Reverse Proxy**, create a rule:
+
+   | Setting | Value |
+   | --- | --- |
+   | Source | HTTPS, `share.example.com`, port `443` |
+   | Destination | HTTP, `127.0.0.1`, port `8088` |
+
+   Assign a certificate to the public domain. Preserve the original Host and Origin. Adjust the reverse proxy request size limits and timeouts to match the upload limit and transfer duration; disable buffering for large files if your configuration supports it. An example for an nginx instance you manage is in `deploy/nginx.example.conf`.
+5. Route the public domain only to this container. The container port is bound to loopback; do not expose the DSM administration interface through this domain. Prevent reverse proxy access/error logs from recording URLs containing share tokens. For larger numbers of visitors, configure per-client rate limiting on the reverse proxy, since the application uses the direct connection IP address.
+6. Create a link through DSM File Station and change only its host:
+
+   ```text
+   DSM:   https://nas.example.com:5001/sharing/EXAMPLE123
+   Proxy: https://share.example.com/sharing/EXAMPLE123
+   ```
+
+   `EXAMPLE123` is a fictional token. DSM continues to manage expiration and the password. Public shares and File Request are supported; links requiring a DSM account or a visit counter are rejected.
+
+Container Manager and reverse proxy configuration are described in [Synology Project](https://kb.synology.com/en-global/DSM/help/ContainerManager/docker_project) and [Login Portal](https://kb.synology.com/en-af/DSM/help/DSM/AdminCenter/system_login_portal?version=7). Web Station is not required when configuring the reverse proxy directly.
+
+To update to a newly published image:
 
 ```sh
-dotnet test SynologyPublicShareProxy.slnx -c Release
-node --check src/ShareProxy/wwwroot/app.js
-python tests/http_smoke.py
+docker compose pull
+docker compose up -d
 ```
 
-`http_smoke.py` používa Release build vytvorený testami a spustí izolovaný localhost proces. Testy majú iba syntetické dáta; HAR ani tajomstvá nie sú súčasťou repozitára.
+Compose runs the process as a non-root user, with a read-only filesystem and no NAS file volumes. Diagnostic logs are available in Container Manager or through `docker compose logs --tail=100 share-proxy`; they contain a request identifier and safe status information, without URLs, passwords, cookies or filenames. Set `DIAGNOSTICS_VERBOSE=true` in `.env` to enable more detailed operation status logs.
 
-Lokálny UI náhľad v PowerShell:
+## Standalone Compose example for Container Manager
 
-```powershell
-$env:ASPNETCORE_ENVIRONMENT='Development'
-$env:Proxy__DemoMode='true'
-$env:Proxy__PublicOrigin='http://localhost:5188'
-dotnet run --project src/ShareProxy --urls http://localhost:5188
+Ready-to-use file: [compose.synology.example.yaml](compose.synology.example.yaml).
+
+In **Container Manager → Project → Create**, choose a project directory and paste the following into the Compose editor. Replace the two example origins before starting the project. The image must have been published by the GitHub workflow; use a public GHCR package or configure registry authentication in Container Manager.
+
+```yaml
+services:
+  share-proxy:
+    image: ghcr.io/unlink/synology-public-share-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8088:8080"
+    environment:
+      Proxy__DsmOrigin: "http://192.168.1.20:5000"
+      Proxy__PublicOrigin: "https://share.example.com"
+      Proxy__UploadsEnabled: "true"
+      Proxy__PasswordLoginEnabled: "true"
+      Proxy__MaxUploadBytes: "1073741824"
+      Proxy__MaxDownloadBytes: "10737418240"
+      Proxy__MaxConcurrentTransfers: "4"
+      Proxy__TransferTimeoutSeconds: "1800"
+      Proxy__IdleTimeoutSeconds: "60"
+      Proxy__DiagnosticsVerbose: "false"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
 ```
 
-Otvorte `http://localhost:5188/s/demo-share`, `/s/demo-upload`, `/s/demo-password` (heslo `atelier`) alebo `/s/demo-expired`. Ukážkové uploady sa zahadzujú. Demo režim vyžaduje Development a loopback návštevníka; produkčný štart s DemoMode zlyhá. V produkcii nechajte `Proxy__DemoMode=false` a `ASPNETCORE_ENVIRONMENT=Production`.
-
-Záznam výsledkov a screenshoty: [QA](docs/QA.md). Presný zoznam zachytených operácií a hraníc poznania: [protokol](docs/PROTOCOL.md). Verejné API: [API](docs/API.md).
-
-## Bezpečnosť a prevádzkové logy
-
-Share token je bearer secret. Aplikácia neloguje URL, názvy súborov, telá požiadaviek, heslá, upstream hlavičky ani výnimky s ich obsahom. Zabezpečte rovnaké pravidlo na DSM/Web Station/reverse proxy a prípadnom CDN: URL token sa môže objaviť v ich access/error logoch. Ukážka nginx vypína logovanie tohto virtual hosta. HAR nepoužívajte ako verejné issue prílohy.
-
-Proxy nemá žiadny endpoint na všeobecné forwardovanie. Neberie upstream URL, API meno ani raw filesystem path od návštevníka. Náhodné file ID platí iba pre položku enumerovanú v danej zdieľacej relácii; pred downloadom sa znovu overí dostupnosť share. Všetky ďalšie cesty vracajú 404. Cookies sú HttpOnly, SameSite=Strict a v produkcii Secure s `__Host-` prefixom. Origin, Host a CSRF sa kontrolujú pri zápisoch; CSP zakazuje cudzie skripty a framing.
-
-DSM origin a jeho DNS sú dôveryhodná konfigurácia prevádzkovateľa. Obmedzte egress kontajnera na NAS a dôveryhodné DNS; návštevník nemôže adresu zmeniť. TLS reťazec a hostname sa overujú štandardným .NET handlerom; redirecty, systémová HTTP proxy aj ambientné credentials sú vypnuté. Žiadne DSM admin credentials nepatria do `.env`.
-
-## Inšpirácia
-
-[immich-public-proxy](https://github.com/alangrainger/immich-public-proxy) poslúžil ako referencia pre princíp verejného zdieľania bez privilegovaného API kľúča, overovanie členstva súboru v zdieľaní a odmietnutie ostatných trás. Preštudované boli jeho README, `app/src/index.ts` a `app/src/immich.ts`. Tento projekt má samostatnú implementáciu; kód ani assety referenčného projektu neboli skopírované.
+This example keeps all settings in Compose and does not require an `.env` file. The DSM origin is a private address reachable from the container. Configure the HTTPS reverse proxy described above with destination `http://127.0.0.1:8088`. Do not publish the container's port on all network interfaces.

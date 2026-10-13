@@ -1,0 +1,14 @@
+{
+  "profiles": {
+    "ShareProxy": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "Proxy__PublicOrigin": "https://localhost:57120",
+        "Proxy__DiagnosticsVerbose": "true"
+      },
+      "applicationUrl": "https://localhost:57120;http://localhost:57121"
+    }
+  }
+}

@@ -1,4 +1,3 @@
-using System.Net;
 using System.Text.Json;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Http.Features;
@@ -6,11 +5,11 @@ using Microsoft.AspNetCore.WebUtilities;
 using ShareProxy;
 
 var builder = WebApplication.CreateBuilder(args);
-// Suppress request URLs, bodies and exception messages: share tokens occur in paths.
+// Only our safe diagnostic category is allowed, irrespective of Logging configuration.
 builder.Logging.ClearProviders();
-builder.Logging.AddSimpleConsole(o => o.SingleLine = true);
-builder.Logging.SetMinimumLevel(LogLevel.Warning);
-builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.None);
+builder.Logging.AddSimpleConsole(o => { o.SingleLine = true; o.IncludeScopes = false; o.UseUtcTimestamp = true; o.TimestampFormat = "yyyy-MM-dd HH:mm:ss'Z' "; });
+builder.Logging.AddDebug();
+builder.Services.PostConfigure<LoggerFilterOptions>(ProxyDiagnostics.ConfigureFilters);
 var options = builder.Configuration.GetSection("Proxy").Get<ProxyOptions>() ?? new();
 var development = builder.Environment.IsDevelopment();
 var dsmOrigin = options.Validate(development);
@@ -23,7 +22,9 @@ builder.WebHost.ConfigureKestrel(k =>
     k.Limits.MaxConcurrentConnections = 128;
 });
 builder.Services.AddSingleton(options);
-builder.Services.AddSingleton(new SessionStore(options, dsmOrigin, development));
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddSingleton<ProxyDiagnostics>();
+builder.Services.AddSingleton(s => new SessionStore(options, dsmOrigin, development, s.GetRequiredService<ProxyDiagnostics>()));
 builder.Services.AddRateLimiter(o =>
 {
     o.RejectionStatusCode = 429;
@@ -42,12 +43,14 @@ builder.Services.AddRateLimiter(o =>
     };
 });
 var app = builder.Build();
+var diagnostics = app.Services.GetRequiredService<ProxyDiagnostics>();
+app.Lifetime.ApplicationStarted.Register(diagnostics.Started);
 var transfers = new SemaphoreSlim(options.MaxConcurrentTransfers);
 app.Lifetime.ApplicationStopped.Register(transfers.Dispose);
-var demoUnlocks = new System.Collections.Concurrent.ConcurrentDictionary<string, bool>();
 
 app.Use(async (context, next) =>
 {
+    var trace = diagnostics.Begin(context);
     var h = context.Response.Headers;
     var downloadFrame = context.GetEndpoint()?.Metadata.GetMetadata<DownloadFramePolicy>() != null;
     h.ContentSecurityPolicy = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; frame-src 'self'; frame-ancestors "
@@ -66,29 +69,23 @@ app.Use(async (context, next) =>
         // Bind the public host as well as Origin; no host-derived upstream addresses or redirects.
         if (context.Request.Path != "/healthz" && !string.Equals(context.Request.Host.Value, expected.Authority, StringComparison.OrdinalIgnoreCase))
             throw new ProxyException(400, "request_rejected");
-        if (options.DemoMode && (context.Connection.RemoteIpAddress == null || !IPAddress.IsLoopback(context.Connection.RemoteIpAddress)))
-            throw new ProxyException(403, "request_rejected");
         if (context.Request.Method == "POST" && context.Request.Headers.Origin.ToString().TrimEnd('/') != options.PublicOrigin.TrimEnd('/'))
             throw new ProxyException(403, "request_rejected");
         await next(context);
+        if (context.Response.StatusCode == 429)
+            diagnostics.Failed(trace, new(429, "rate_limited", "rate_limited"), false);
+        else diagnostics.Completed(trace, context.Response.StatusCode);
     }
     catch (Exception error)
     {
+        var failure = ProxyDiagnostics.Classify(error, context.RequestAborted.IsCancellationRequested);
+        diagnostics.Failed(trace, failure, context.Response.HasStarted);
         if (context.Response.HasStarted) { context.Abort(); return; }
-        var (status, code) = error switch
-        {
-            ProxyException p => (p.Status, p.Code),
-            JsonException => (502, "protocol_error"),
-            BadHttpRequestException b => (b.StatusCode, "request_rejected"),
-            OperationCanceledException => (504, "timeout"),
-            HttpRequestException => (502, "upstream_unavailable"),
-            _ => (502, "protocol_error")
-        };
         context.Response.ContentLength = null;
         context.Response.Headers.Remove("Content-Disposition");
-        context.Response.StatusCode = status;
+        context.Response.StatusCode = failure.Status;
         if (!context.RequestAborted.IsCancellationRequested)
-            await context.Response.WriteAsJsonAsync(new { code }, context.RequestAborted);
+            await context.Response.WriteAsJsonAsync(new { code = failure.Code, requestId = trace.Id }, context.RequestAborted);
     }
 });
 app.UseRateLimiter();
@@ -105,14 +102,13 @@ app.MapGet("/healthz", () => Results.Json(new { status = "ok" }));
 app.MapGet("/api/session", (HttpContext c, SessionStore store) =>
 {
     using var lease = store.Acquire(c);
-    return Results.Json(new { csrf = lease.Browser.Csrf, demo = options.DemoMode });
+    return Results.Json(new { csrf = lease.Browser.Csrf });
 }).RequireRateLimiting("api");
 
 app.MapGet("/api/shares/{token}", async (string token, HttpContext c, SessionStore store) =>
 {
     Input.Token(token);
     using var lease = store.Acquire(c);
-    if (options.DemoMode) return Results.Json(Demo.Info(token, demoUnlocks.ContainsKey(lease.Browser.Id), options));
     var gateway = store.Connection(lease.Browser, token);
     if (!await gateway.Gate.WaitAsync(0, c.RequestAborted)) throw new ProxyException(429, "share_busy");
     try { return Results.Json((await gateway.ValidateAsync(c.RequestAborted)).Public); }
@@ -123,18 +119,13 @@ app.MapPost("/api/shares/{token}/unlock", async (string token, HttpContext c, Se
 {
     using var lease = store.Acquire(c);
     SessionStore.CheckCsrf(c.Request.Headers["X-Share-CSRF"].ToString(), lease.Browser);
-    var payload = JsonSerializer.Deserialize<UnlockRequest>(await SmallBody(c, 8192), new JsonSerializerOptions(JsonSerializerDefaults.Web))
-        ?? throw new ProxyException(400, "invalid_password");
-    if (payload.Password == null) throw new ProxyException(400, "invalid_password");
+    if (!string.Equals(c.Request.ContentType?.Split(';')[0].Trim(), "application/json", StringComparison.OrdinalIgnoreCase))
+        throw new ProxyException(415, "request_rejected");
+    var password = ReadPassword(await SmallBody(c, 8192));
     Input.Token(token);
-    if (options.DemoMode)
-    {
-        if (token != "demo-password" || payload.Password != "atelier") throw new ProxyException(401, "invalid_password");
-        demoUnlocks[lease.Browser.Id] = true; return Results.NoContent();
-    }
     var gateway = store.Connection(lease.Browser, token);
     if (!await gateway.Gate.WaitAsync(0, c.RequestAborted)) throw new ProxyException(429, "share_busy");
-    try { await gateway.UnlockAsync(payload.Password, c.RequestAborted); return Results.NoContent(); }
+    try { await gateway.UnlockAsync(password, c.RequestAborted); return Results.NoContent(); }
     finally { gateway.Gate.Release(); }
 }).RequireRateLimiting("unlock");
 
@@ -142,12 +133,6 @@ app.MapGet("/api/shares/{token}/files", async (string token, string? folder, int
 {
     using var lease = store.Acquire(c);
     Input.Token(token);
-    if (options.DemoMode)
-    {
-        Demo.Info(token, demoUnlocks.ContainsKey(lease.Browser.Id), options);
-        var files = folder == null ? Demo.Files : new[] { new PublicFile("demo_file_photo_0006", "Atelier — fotografia.txt", false, 128, 1791626400) };
-        return Results.Json(new FilePage(files, 0, files.Length));
-    }
     var gateway = store.Connection(lease.Browser, token);
     if (!await gateway.Gate.WaitAsync(0, c.RequestAborted)) throw new ProxyException(429, "share_busy");
     try { return Results.Json(await gateway.ListAsync(folder, offset ?? 0, c.RequestAborted)); }
@@ -157,23 +142,34 @@ app.MapGet("/api/shares/{token}/files", async (string token, string? folder, int
 app.MapPost("/api/shares/{token}/download", async (string token, HttpContext c, SessionStore store) =>
 {
     using var lease = store.Acquire(c);
-    if (!c.Request.ContentType?.StartsWith("application/x-www-form-urlencoded", StringComparison.OrdinalIgnoreCase) ?? true)
+    if (!string.Equals(c.Request.ContentType?.Split(';')[0].Trim(), "application/x-www-form-urlencoded", StringComparison.OrdinalIgnoreCase))
         throw new ProxyException(415, "request_rejected");
     var form = QueryHelpers.ParseQuery(await SmallBody(c, 16384));
-    SessionStore.CheckCsrf(form["csrf"].ToString(), lease.Browser);
-    var ids = JsonSerializer.Deserialize<string[]>(form["ids"].ToString()) ?? throw new ProxyException(400, "invalid_selection");
+    if (form.Any(p => p.Value.Count != 1 || p.Key is not ("csrf" or "ids" or "receipt")) ||
+        !form.TryGetValue("csrf", out var csrf) || !form.TryGetValue("ids", out var selection))
+        throw new ProxyException(400, "request_rejected");
+    SessionStore.CheckCsrf(csrf.ToString(), lease.Browser);
+    string[] ids;
+    try { ids = JsonSerializer.Deserialize<string[]>(selection.ToString()) ?? throw new ProxyException(400, "invalid_selection"); }
+    catch (JsonException) { throw new ProxyException(400, "invalid_selection"); }
+    if (ids.Length is < 1 or > 100 || ids.Any(id => !Input.Id(id)) || ids.Distinct().Count() != ids.Length)
+        throw new ProxyException(400, "invalid_selection");
+    var receipt = form.TryGetValue("receipt", out var receiptValue) ? receiptValue.ToString() : "";
+    if (receipt.Length > 0 && (receipt.Length != 32 || receipt.Any(c => !char.IsAsciiHexDigit(c) || char.IsUpper(c))))
+        throw new ProxyException(400, "request_rejected");
+    if (receipt.Length > 0) c.Response.OnStarting(() =>
+    {
+        // One-bit, non-authentication marker for native download readiness. Never includes file/token data.
+        // Error responses have their attachment header removed and do not create this cookie.
+        if (c.Response.StatusCode == 200 && c.Response.Headers.ContentDisposition.ToString().StartsWith("attachment", StringComparison.OrdinalIgnoreCase))
+            c.Response.Cookies.Append("download-ready-" + receipt, "1", new CookieOptions
+            { HttpOnly = false, Secure = new Uri(options.PublicOrigin).Scheme == "https", SameSite = SameSiteMode.Strict, Path = "/", MaxAge = TimeSpan.FromMinutes(2) });
+        return Task.CompletedTask;
+    });
     Input.Token(token);
     if (!await transfers.WaitAsync(0, c.RequestAborted)) throw new ProxyException(429, "server_busy");
     try
     {
-        if (options.DemoMode)
-        {
-            Demo.Info(token, demoUnlocks.ContainsKey(lease.Browser.Id), options);
-            if (ids.Length is < 1 or > 100) throw new ProxyException(400, "invalid_selection");
-            c.Response.ContentType = "text/plain";
-            c.Response.Headers.ContentDisposition = "attachment; filename=demo-download.txt";
-            await c.Response.WriteAsync("Lokálny náhľad. Skutočné súbory bude streamovať DSM.", c.RequestAborted); return;
-        }
         var gateway = store.Connection(lease.Browser, token);
         if (!await gateway.Gate.WaitAsync(0, c.RequestAborted)) throw new ProxyException(429, "share_busy");
         try { await gateway.DownloadAsync(ids, c.Response, c.RequestAborted); }
@@ -195,12 +191,6 @@ app.MapPost("/api/shares/{token}/upload", async (string token, HttpContext c, Se
     if (!await transfers.WaitAsync(0, c.RequestAborted)) throw new ProxyException(429, "server_busy");
     try
     {
-        if (options.DemoMode)
-        {
-            if (Demo.Info(token, false, options).Mode != "upload") throw new ProxyException(403, "upload_not_allowed");
-            await TransferIO.CopyAsync(c.Request.Body, Stream.Null, length, options.IdleTimeoutSeconds, c.RequestAborted, true);
-            return Results.Json(new { status = "uploaded", demo = true });
-        }
         var gateway = store.Connection(lease.Browser, token);
         if (!await gateway.Gate.WaitAsync(0, c.RequestAborted)) throw new ProxyException(429, "share_busy");
         try { await gateway.UploadAsync(c.Request.Body, length, name, uploader, c.RequestAborted); return Results.Json(new { status = "uploaded" }); }
@@ -210,6 +200,20 @@ app.MapPost("/api/shares/{token}/upload", async (string token, HttpContext c, Se
 }).RequireRateLimiting("api");
 app.MapFallback(() => Results.Json(new { code = "not_found" }, statusCode: 404));
 app.Run();
+
+static string ReadPassword(string body)
+{
+    try
+    {
+        using var document = JsonDocument.Parse(body, new JsonDocumentOptions { MaxDepth = 4 });
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object || root.EnumerateObject().Count() != 1 ||
+            !root.TryGetProperty("password", out var value) || value.ValueKind != JsonValueKind.String)
+            throw new ProxyException(400, "invalid_password");
+        return value.GetString()!;
+    }
+    catch (JsonException) { throw new ProxyException(400, "invalid_password"); }
+}
 
 static async Task<string> SmallBody(HttpContext context, int max)
 {
